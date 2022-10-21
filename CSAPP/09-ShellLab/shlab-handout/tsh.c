@@ -37,7 +37,7 @@
  */
 
 /* Global variables */
-extern char** environ; /* defined in libc */
+extern char** environ; /* defined in libc extern这个关键字的真正的作用是引用不在同一个文件中的变量或者函数。*/
 char prompt[] = "tsh> "; /* command line prompt (DO NOT CHANGE) */
 int verbose = 0; /* if true, print additional output */
 int nextjid = 1; /* next job ID to allocate */
@@ -174,6 +174,7 @@ void eval(char* cmdline)
 
     strcpy(buf, cmdline);
     bg = parseline(buf, argv);
+    state = bg ? BG : FG;
 
     // 没有参数就退出
     // 其实可以加一个判断参数数量是否正确的语句，比较完整
@@ -183,43 +184,43 @@ void eval(char* cmdline)
     // 如果不是内置的命令，则执行
     if (!builtin_cmd(argv)) {
         // 在函数内部加阻塞列表，不然之后可能会出现不痛不痒的bug
-        sigfillset(&mask_all);
-        sigemptyset(&mask_one);
-        sigaddset(&mask_one, SIGCHLD);
+        sigfillset(&mask_all); // 将所有信号加入集合
+        sigemptyset(&mask_one); // 清空集合
+        sigaddset(&mask_one, SIGCHLD); // 将sigchld信号加入集合
 
-        // 为了避免父进程运行到addjob之前子进程就退出了，所以
-        // 在fork子进程前阻塞sigchld信号，addjob后解除
+        // 如果父进程没有处理子进程结束的信号sigchld，子进程就会变成僵尸进程
+        // 所以在fork子进程前阻塞sigchld信号，addjob后解除
         sigprocmask(SIG_BLOCK, &mask_one, &prev);
-        if ((pid = fork()) == 0) {
+        if ((pid = fork()) == 0) { // 创建子进程
             // 子进程继承了父进程的阻塞向量，也要解除阻塞，
             // 避免收不到它本身的子进程的信号
             sigprocmask(SIG_SETMASK, &prev, NULL);
             // 改进程组与自己pid一样
             if (setpgid(0, 0) < 0) {
-                perror("SETPGID ERROR");
+                perror("SETPGID ERROR"); // 输出
                 exit(0);
             }
             // 正常运行execve函数会替换内存，不会返回/退出，所以必须要加exit，
             // 否则会一直运行下去，子进程会开始运行父进程的代码
-            if (execve(argv[0], argv, environ) < 0) {
+            if (execve(argv[0], argv, environ) < 0) { // 执行
                 printf("%s: Command not found\n", argv[0]);
                 exit(0);
             }
-        } else {
-            state = bg ? BG : FG;
-            // 依然是加塞，阻塞所有信号
-            sigprocmask(SIG_BLOCK, &mask_all, NULL);
-            addjob(jobs, pid, state, cmdline);
-            sigprocmask(SIG_SETMASK, &prev, NULL);
         }
-        // 后台则打印，前台则等待子进程结束
-        if (!bg)
-            waitfg(pid);
-        else
-            printf("[%d] (%d) %s", pid2jid(pid), pid, cmdline);
 
-        // 后面又想了想，打印后台的时候其实走的是全局变量，也应该加塞才对，
-        // 应该是所有的用到全局变量的都应该加塞，但是懒，不改了，知道就行
+        if (state == FG) {
+            sigprocmask(SIG_BLOCK, &mask_all, NULL); // 添加工作前阻塞所有信号
+            addjob(jobs, pid, state, cmdline); // 添加至作业列表
+            sigprocmask(SIG_SETMASK, &mask_one, NULL);
+            waitfg(pid); // 等待前台进程执行完毕
+        } else {
+            sigprocmask(SIG_BLOCK, &mask_all, NULL); // 添加工作前阻塞所有信号
+            addjob(jobs, pid, state, cmdline); // 添加至作业列表
+            sigprocmask(SIG_SETMASK, &mask_one, NULL);
+            // 因为这里打印了全局变量，而printf函数是线程不安全的，比如可能会出现读内存的同时另一个线程修改它的情况
+            printf("[%d] (%d) %s", pid2jid(pid), pid, cmdline); // 打印后台进程信息
+        }
+        sigprocmask(SIG_SETMASK, &prev, NULL); // 解除阻塞
     }
     return;
 }
@@ -246,11 +247,11 @@ int parseline(const char* cmdline, char** argv)
 
     /* Build the argv list */
     argc = 0;
-    if (*buf == '\'') {
+    if (*buf == '\'') { // 如果是以单引号开头的
         buf++;
-        delim = strchr(buf, '\'');
+        delim = strchr(buf, '\''); // 找到下一个单引号出现的位置
     } else {
-        delim = strchr(buf, ' ');
+        delim = strchr(buf, ' '); // 找到空格出现的位置
     }
 
     while (delim) {
@@ -285,22 +286,60 @@ int parseline(const char* cmdline, char** argv)
  */
 int builtin_cmd(char** argv)
 {
+    if (!strcmp(argv[0], "quit"))
+        exit(0);
+    if (!strcmp(argv[0], "bg") || !strcmp(argv[0], "fg")) {
+        do_bgfg(argv);
+        return 1;
+    }
+    if (!strcmp(argv[0], "jobs")) {
+        listjobs(jobs);
+        return 1;
+    }
+    if (!strcmp(argv[0], "&"))
+        return 1;
     return 0; /* not a builtin command */
 }
 
 /*
  * do_bgfg - Execute the builtin bg and fg commands
+ * SIGCONT 让一个停止(stopped)的进程继续执行. 本信号不能被阻塞.
+ * 可以用一个handler来让程序在由stopped状态变为继续执行时完成特定的工作. 例如, 重新显示提示符
  */
 void do_bgfg(char** argv)
 {
-    return;
+    struct job_t* job = NULL; // 要处理的job
+    int state; // 输入的命令
+    int id; // 存储jid或pid
+    if (!strcmp(argv[0], "bg"))
+        state = BG;
+    else
+        state = FG;
+    if (argv[1] == NULL) {
+        printf("%s command requires pid or %%jobid argument\n", argv[0]);
+        return;
+    }
+    if (argv[1][0] == '%') {
+    }
 }
 
 /*
  * waitfg - Block until process pid is no longer the foreground process
+ * 这个函数从要求实现阻塞父进程，直到当前的前台进程不再是前台进程了。这里显然要显示地等待信号
  */
 void waitfg(pid_t pid)
 {
+    sigset_t mask;
+    sigemptyset(&mask);
+    while (!fgpid(jobs)) {
+        /*
+        该函数相当于
+        sigprocmask(SIG_SETMASK, &mask, &prev);
+        pause();
+        sigprocmask(SIG_SETMASK, &prev, NULL);
+        */
+        sigsuspend(&mask);
+    }
     return;
 }
 
@@ -314,9 +353,35 @@ void waitfg(pid_t pid)
  *     received a SIGSTOP or SIGTSTP signal. The handler reaps all
  *     available zombie children, but doesn't wait for any other
  *     currently running children to terminate.
+ *     子进程终止或停止都可能触发SIGCHLD，所以我们得分类讨论。
  */
 void sigchld_handler(int sig)
 {
+    int olderrno = errno; // 保存错误信息
+    int status;
+    pid_t pid;
+    sigset_t mask, prev;
+    sigfillset(&mask);
+    while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0) { // 立即返回该子进程的pid
+        // 涉及到对全局变量jobs的访问，阻塞所有信号
+        sigprocmask(SIG_BLOCK, &mask, &prev);
+        struct job_t* job = getjobpid(jobs, pid);
+        if (job->state == FG) { // 子进程为前台进程，打开标志
+            fgpid(jobs);
+        }
+
+        if (WIFEXITED(status)) { // 正常退出，删除任务即可
+            deletejob(jobs, pid);
+        } else if (WIFSIGNALED(status)) { // 收到信号非正常退出，打印消息后删除任务
+            printf("Job [%d] (%d) terminated by signal %d\n", job->jid, pid, WTERMSIG(status));
+            deletejob(jobs, pid);
+        } else if (WIFSTOPPED(status)) { // 子进程处于停止状态，切换对应的任务状态
+            job->state = ST;
+            printf("Job [%d] (%d) stopped by signal %d\n", job->jid, pid, WSTOPSIG(status));
+        }
+        sigprocmask(SIG_SETMASK, &prev, NULL);
+    }
+    errno = olderrno;
     return;
 }
 
